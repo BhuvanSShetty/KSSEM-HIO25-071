@@ -3,11 +3,24 @@ import express from 'express';
 import cors from 'cors';
 import mongoose from 'mongoose';
 import cron from 'node-cron';
-import { canonicalStringify, sha256Hex, toDayKey } from './crypto-utils.js';
-import { buildMerkleRoot } from './merkle.js';
-import Reading from './models/Reading.js';
-import Anchor from './models/Anchor.js';
 import http from 'http';
+
+import { canonicalStringify, sha256Hex, toDayKey } from './src/crypto-utils.js';
+import { buildMerkleRoot } from './src/merkle.js';
+
+import Reading from './src/models/Reading.js';
+import Anchor from './src/models/Anchor.js';
+import User from './src/models/User.js';
+import Device from './src/models/Device.js';
+import FarmerDayAudit from './src/models/FarmerDayAudit.js';
+
+import authRoutes from './src/routes/auth.js';
+import deviceRoutes from './src/routes/devices.js';
+import adminRoutes from './src/routes/admin.js';
+import { authOptional, authRequired, requireAdmin } from './src/middleware/auth.js';
+
+import { verifyFarmerWindowSelectivePurge, verifyAllFarmersWindowSelectivePurge } from './src/services/integrity.js';
+import { router as dashboardRoutes } from './src/routes/dashboard.js';
 
 const app = express();
 app.use(cors());
@@ -18,6 +31,7 @@ const MONGO_URI = process.env.MONGO_URI;
 const WITNESS_URLS = (process.env.WITNESS_URLS || '').split(',').map(s => s.trim()).filter(Boolean);
 const ANCHOR_QUORUM = parseInt(process.env.ANCHOR_QUORUM || '2', 10);
 const RAW_RETENTION_DAYS = parseInt(process.env.RAW_RETENTION_DAYS || '90', 10);
+const VERIFY_WINDOW_DAYS = parseInt(process.env.VERIFY_WINDOW_DAYS || '20', 10);
 
 await mongoose.connect(MONGO_URI);
 
@@ -51,20 +65,37 @@ function httpPostJson(url, body) {
   });
 }
 
-// --- Routes ---
+// --- Auth & Admin routes ---
+app.use('/api/auth', authRoutes);
+app.use('/api/devices', authRequired, deviceRoutes);
+app.use('/api/admin', authRequired, requireAdmin, adminRoutes);
 
-// Ingest a sensor reading
+// Dashboard routes (trust score, history, etc.)
+app.use('/api/dashboard', authRequired, dashboardRoutes);
+
+// --- Ingest a sensor reading (must be from registered device) ---
 app.post('/api/ingest', async (req, res) => {
   try {
-    const { payload } = req.body;
+    const { payload, deviceId } = req.body;
     if (!payload) return res.status(400).json({ error: 'payload required' });
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+
+    const device = await Device.findOne({ deviceId }).lean();
+    if (!device) return res.status(404).json({ error: 'unknown_device' });
 
     const ts = payload.timestamp ? new Date(payload.timestamp) : new Date();
     const dayKey = toDayKey(ts);
     const canonical = canonicalStringify(payload);
     const leafHash = sha256Hex(canonical);
 
-    const doc = await Reading.create({ payload, leafHash, ts, dayKey });
+    const doc = await Reading.create({
+      payload,
+      leafHash,
+      ts,
+      dayKey,
+      farmerId: device.farmerId,
+      deviceId: device.deviceId
+    });
     return res.json({ ok: true, id: doc._id, leafHash, dayKey });
   } catch (e) {
     console.error(e);
@@ -72,10 +103,9 @@ app.post('/api/ingest', async (req, res) => {
   }
 });
 
-// Status for last 30 days
+// --- Status for last 30 days (global) ---
 app.get('/api/status/30days', async (req, res) => {
   try {
-    // Build list of last 30 dayKeys (UTC)
     const days = [];
     const now = new Date();
     for (let i = 0; i < 30; i++) {
@@ -91,6 +121,7 @@ app.get('/api/status/30days', async (req, res) => {
         dayKey,
         anchored: !!a,
         quorumMet: !!a?.quorumMet,
+        tampered: !!a?.tampered,
         signatures: a ? a.signatures.length : 0
       };
     });
@@ -101,7 +132,7 @@ app.get('/api/status/30days', async (req, res) => {
   }
 });
 
-// Verify a payload against the anchored root (server builds tree for that day)
+// --- Verify a payload against the anchored root (server builds tree for that day) ---
 app.post('/api/verify', async (req, res) => {
   try {
     const { payload } = req.body;
@@ -112,20 +143,15 @@ app.post('/api/verify', async (req, res) => {
 
     const dayKey = toDayKey(ts);
 
-    // Load anchored root for that day
     const anchor = await Anchor.findOne({ dayKey }).lean();
     if (!anchor) return res.json({ consistent: false, reason: 'no_anchor_for_day' });
 
-    // Build merkle root from stored leaf hashes for that day
     const leaves = await Reading.find({ dayKey }).select('leafHash').lean();
     if (leaves.length === 0) return res.json({ consistent: false, reason: 'no_leaves_for_day' });
 
     const computedRoot = buildMerkleRoot(leaves.map(l => l.leafHash));
-
-    // Recompute leaf for given payload
     const leaf = sha256Hex(canonicalStringify(payload));
 
-    // Consistency means the leaf exists in the set & tree root matches anchor
     const leafExists = leaves.some(l => l.leafHash === leaf);
     const rootMatches = computedRoot === anchor.merkleRoot;
 
@@ -136,7 +162,7 @@ app.post('/api/verify', async (req, res) => {
       consistent: leafExists && rootMatches,
       quorumMet,
       validSigs,
-      needed: parseInt(process.env.ANCHOR_QUORUM || '2', 10),
+      needed: ANCHOR_QUORUM,
       anchorRoot: anchor.merkleRoot,
       computedRoot,
       dayKey
@@ -163,7 +189,6 @@ cron.schedule('*/5 * * * *', async () => {
 
     const root = buildMerkleRoot(leaves.map(l => l.leafHash));
 
-    // Ask witnesses to sign
     const sigs = [];
     for (const url of WITNESS_URLS) {
       try {
@@ -177,24 +202,90 @@ cron.schedule('*/5 * * * *', async () => {
     }
     const quorumMet = sigs.length >= ANCHOR_QUORUM;
 
-    await Anchor.create({ dayKey, merkleRoot: root, signatures: sigs, quorumMet });
+    await Anchor.create({ dayKey, merkleRoot: root, signatures: sigs, quorumMet, tampered: false });
     console.log(`[anchor] anchored ${dayKey} root=${root} sigs=${sigs.length}`);
   } catch (e) {
     console.error('anchor_cron_failed', e);
   }
 });
 
-// --- Cron: raw retention cleanup (runs nightly 02:00 UTC) ---
+// --- Cron: GLOBAL RAW retention cleanup (nightly) ---
 cron.schedule('0 2 * * *', async () => {
   try {
     if (RAW_RETENTION_DAYS <= 0) return;
     const cutoff = new Date();
     cutoff.setUTCDate(cutoff.getUTCDate() - RAW_RETENTION_DAYS);
-    const res = await Reading.deleteMany({ ts: { $lt: cutoff } });
-    console.log(`[retention] removed ${res.deletedCount} old readings`);
+    const resDel = await Reading.deleteMany({ ts: { $lt: cutoff } });
+    console.log(`[retention] removed ${resDel.deletedCount} old readings`);
   } catch (e) {
     console.error('retention_failed', e);
   }
 });
+
+// --- Cron: Farmer selective purge (3:30 UTC) ---
+cron.schedule('30 3 * * *', async () => {
+  try {
+    await verifyAllFarmersWindowSelectivePurge({ days: VERIFY_WINDOW_DAYS });
+  } catch (e) {
+    console.error('selective_purge_failed', e);
+  }
+});
+
+// Temporary debug route - DO NOT enable in production
+app.post('/api/debug/anchor-now', async (req, res) => {
+  try {
+    const now = new Date();
+    const y = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+    y.setUTCDate(y.getUTCDate() - 1);
+    const dayKey = toDayKey(now);
+
+    const exists = await Anchor.findOne({ dayKey }).lean();
+    if (exists) return res.json({ ok: false, message: 'already anchored', dayKey });
+
+    const leaves = await Reading.find({ dayKey }).select('leafHash').lean();
+    if (leaves.length === 0) return res.json({ ok: false, message: 'no data to anchor', dayKey });
+
+    const root = buildMerkleRoot(leaves.map(l => l.leafHash));
+
+    const sigs = [];
+    for (const url of WITNESS_URLS) {
+      const resp = await httpPostJson(url, { dayKey, merkleRoot: root });
+      if (resp?.signature) sigs.push(resp);
+    }
+
+    const quorumMet = sigs.length >= ANCHOR_QUORUM;
+    const doc = await Anchor.create({ dayKey, merkleRoot: root, signatures: sigs, quorumMet });
+
+    res.json({ ok: true, anchored: doc });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'anchor_failed' });
+  }
+});
+
+app.post('/api/debug/run-purge', async (req, res) => {
+  try {
+    const out = await verifyAllFarmersWindowSelectivePurge({ days: VERIFY_WINDOW_DAYS });
+    res.json({ ok: true, result: out });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'purge_failed' });
+  }
+});
+
+app.post('/api/debug/cleanup-now', async (req, res) => {
+  try {
+    const cutoff = new Date();
+    cutoff.setUTCDate(cutoff.getUTCDate() - RAW_RETENTION_DAYS);
+    const result = await Reading.deleteMany({ ts: { $lt: cutoff } });
+    res.json({ ok: true, deleted: result.deletedCount });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'cleanup_failed' });
+  }
+});
+
+
+
 
 app.listen(PORT, () => console.log(`Backend listening on http://localhost:${PORT}`));

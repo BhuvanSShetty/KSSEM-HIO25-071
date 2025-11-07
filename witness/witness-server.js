@@ -21,7 +21,7 @@ const keyPair = nacl.sign.keyPair.fromSeed(seed);
 const publicKeyB64 = encodeBase64(keyPair.publicKey);
 
 // POST /sign { dayKey, merkleRoot }
-app.post('/sign', (req, res) => {
+app.post('/', (req, res) => {
   const { dayKey, merkleRoot } = req.body || {};
   if (!dayKey || !merkleRoot) return res.status(400).json({ error: 'dayKey and merkleRoot required' });
 
