@@ -103,6 +103,68 @@ app.post('/api/ingest', async (req, res) => {
   }
 });
 
+import fs from 'fs';
+import path from 'path';
+
+app.post('/api/ingest-bulk', async (req, res) => {
+  try {
+    const filePath = path.join(process.cwd(), 'data', 'ksdev002-21days.json');
+
+    if (!fs.existsSync(filePath)) {
+      return res.status(400).json({ error: 'file_not_found' });
+    }
+
+    const fileData = fs.readFileSync(filePath, 'utf-8');
+    const items = JSON.parse(fileData);
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: 'no_records_in_file' });
+    }
+
+    const deviceIds = [...new Set(items.map(i => i.deviceId))];
+    const devices = await Device.find({ deviceId: { $in: deviceIds } }).lean();
+    const deviceMap = new Map(devices.map(d => [d.deviceId, d]));
+
+    const docs = [];
+
+    for (const item of items) {
+      const { payload, deviceId } = item;
+      if (!payload || !deviceId) continue;
+
+      const device = deviceMap.get(deviceId);
+      if (!device) continue;
+
+      const ts = payload.timestamp ? new Date(payload.timestamp) : new Date();
+      const dayKey = toDayKey(ts);
+      const canonical = canonicalStringify(payload);
+      const leafHash = sha256Hex(canonical);
+
+      docs.push({
+        payload,
+        leafHash,
+        ts,
+        dayKey,
+        farmerId: device.farmerId,
+        deviceId: device.deviceId
+      });
+    }
+
+    if (docs.length === 0) {
+      return res.status(400).json({ error: 'no_valid_records' });
+    }
+
+    const inserted = await Reading.insertMany(docs);
+    return res.json({ ok: true, count: inserted.length });
+
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'ingest_bulk_failed' });
+  }
+});
+
+
+
+
 // --- Status for last 30 days (global) ---
 app.get('/api/status/30days', async (req, res) => {
   try {
@@ -237,7 +299,7 @@ app.post('/api/debug/anchor-now', async (req, res) => {
     const now = new Date();
     const y = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
     y.setUTCDate(y.getUTCDate() - 1);
-    const dayKey = toDayKey(now);
+    const dayKey = toDayKey(y);
 
     const exists = await Anchor.findOne({ dayKey }).lean();
     if (exists) return res.json({ ok: false, message: 'already anchored', dayKey });
@@ -285,6 +347,58 @@ app.post('/api/debug/cleanup-now', async (req, res) => {
   }
 });
 
+//--TEST--
+app.post('/api/debug/anchor-each', async (req, res) => {
+  try {
+    // get all unique dayKeys from readings
+    const dayKeys = await Reading.distinct('dayKey');
+
+    const results = [];
+
+    for (const dayKey of dayKeys) {
+      // skip if anchor already exists for that day
+      const exists = await Anchor.findOne({ dayKey }).lean();
+      if (exists) {
+        results.push({ dayKey, skipped: true, reason: 'already anchored' });
+        continue;
+      }
+
+      // fetch all readings for that day
+      const leaves = await Reading.find({ dayKey }).select('leafHash').lean();
+      if (leaves.length === 0) {
+        results.push({ dayKey, skipped: true, reason: 'no readings' });
+        continue;
+      }
+
+      // build merkle root (in your test each leaf array has length = 1)
+      const root = buildMerkleRoot(leaves.map(l => l.leafHash));
+
+      // collect witness signatures
+      const sigs = [];
+      for (const url of WITNESS_URLS) {
+        const resp = await httpPostJson(url, { dayKey, merkleRoot: root });
+        if (resp?.signature) sigs.push(resp);
+      }
+
+      const quorumMet = sigs.length >= ANCHOR_QUORUM;
+
+      const doc = await Anchor.create({
+        dayKey,
+        merkleRoot: root,
+        signatures: sigs,
+        quorumMet
+      });
+
+      results.push({ dayKey, anchored: true, root, quorumMet });
+    }
+
+    res.json({ ok: true, results });
+
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'anchor_failed' });
+  }
+});
 
 
 
